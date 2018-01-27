@@ -6,10 +6,11 @@
  * launchd-portrep
  * ================================================================================================
  *
- *  launchd-portrep is an exploit for a port replacement vulnerability in launchd. By sending a
- *  crafted Mach message to the bootstrap port, launchd can be coerced into deallocating its send
- *  right for any Mach port to which the attacker also has a send right. This allows the attacker
- *  to impersonate any launchd service it can look up to the rest of the system.
+ *  launchd-portrep is an exploit for a port replacement vulnerability in launchd, the initial
+ *  userspace process and service management daemon on macOS. By sending a crafted Mach message to
+ *  the bootstrap port, launchd can be coerced into deallocating its send right for any Mach port
+ *  to which the attacker also has a send right. This allows the attacker to impersonate any
+ *  launchd service it can look up to the rest of the system.
  *
  *
  * The vulnerability
@@ -17,22 +18,94 @@
  *
  *  Launchd multiplexes multiple different Mach message handlers over its main port, including a
  *  MIG handler for exception messages. If a process sends a mach_exception_raise or
- *  mach_exception_raise_state_identity message to its bootstrap port, launchd will receive and
+ *  mach_exception_raise_state_identity message to its own bootstrap port, launchd will receive and
  *  process that message as a host-level exception.
  *
- *  Unfortunately, launchd's handling of these messages is buggy. If the exception type is 10
- *  (EXC_CRASH), then launchd will deallocate the thread and task ports sent in the message and
- *  then return 5 (KERN_FAILURE) from the service routine, causing the MIG system to deallocate the
- *  thread and task ports again. (The assumption is that if a service routine returns success, then
- *  the service routine has taken ownership of all resources in the Mach message, while if the
- *  service routine returns an error, then the service routine has taken ownership of none of the
- *  resources.)
+ *  Unfortunately, launchd's handling of these messages is buggy. If the exception type is
+ *  EXC_CRASH, then launchd will deallocate the thread and task ports sent in the message and then
+ *  return KERN_FAILURE from the service routine, causing the MIG system to deallocate the thread
+ *  and task ports again. (The assumption is that if a service routine returns success, then it has
+ *  taken ownership of all resources in the Mach message, while if the service routine returns an
+ *  error, then it has taken ownership of none of the resources.)
  *
- *  This can be exploited to free launchd's send right to any Mach port to which the attacking
- *  process also has a send right. In particular, if the attacker can look up a system service
- *  using launchd, then it can free launchd's send right to that service and then impersonate the
- *  service to the rest of the system. After that there are many different routes to gain system
- *  privileges.
+ *  Here is the code from launchd's service routine for mach_exception_raise messages, decompiled
+ *  using IDA/Hex-Rays and lightly edited for readability:
+ *
+ *  	kern_return_t __fastcall
+ *  	catch_mach_exception_raise(                             // (a) The service routine is
+ *  	        mach_port_t           exception_port,           //     called with values directly
+ *  	        mach_port_t           thread,                   //     from the Mach message
+ *  	        mach_port_t           task,                     //     sent by the client. The
+ *  	        unsigned int          exception,                //     thread and task ports could
+ *  	        mach_exception_data_t code,                     //     be arbitrary send rights.
+ *  	        unsigned int          codeCnt)
+ *  	{
+ *  	    kern_return_t kr;      // eax@1 MAPDST
+ *  	    kern_return_t result;  // eax@10
+ *  	    int pid;               // [rsp+14h] [rbp-43Ch]@1
+ *  	    char codes_str[1024];  // [rsp+20h] [rbp-430h]@5
+ *  	    __int64 __stack_guard; // [rsp+420h] [rbp-30h]@1
+ *
+ *  	    __stack_guard = *__stack_chk_guard_ptr;
+ *  	    pid = -1;
+ *  	    kr = pid_for_task(task, &pid);
+ *  	    if ( kr )
+ *  	    {
+ *  	        _os_assumes_log(kr);
+ *  	        _os_avoid_tail_call();
+ *  	    }
+ *  	    if ( codeCnt )
+ *  	    {
+ *  	        do
+ *  	        {
+ *  	            __snprintf_chk(codes_str, 0x400uLL, 0, 0x400uLL, "0x%llx", *code);
+ *  	            ++code;
+ *  	            --codeCnt;
+ *  	        }
+ *  	        while ( codeCnt );
+ *  	    }
+ *  	    launchd_log_2(
+ *  	        0LL,
+ *  	        3LL,
+ *  	        "Host-level exception raised: pid = %d, thread = 0x%x, "
+ *  	            "exception type = 0x%x, codes = { %s }",
+ *  	        pid,
+ *  	        thread,
+ *  	        exception,
+ *  	        codes_str);
+ *  	    kr = deallocate_mach_port(thread);                  // (b) The "thread" port sent in
+ *  	    if ( kr )                                           //     the message is deallocated.
+ *  	    {
+ *  	        _os_assumes_log(kr);
+ *  	        _os_avoid_tail_call();
+ *  	    }
+ *  	    kr = deallocate_mach_port(task);                    // (c) The "task" port sent in the
+ *  	    if ( kr )                                           //     message is deallocated.
+ *  	    {
+ *  	        _os_assumes_log(kr);
+ *  	        _os_avoid_tail_call();
+ *  	    }
+ *  	    result = 0;
+ *  	    if ( *__stack_chk_guard_ptr == __stack_guard )
+ *  	    {
+ *  	        LOBYTE(result) = exception == 10;               // (d) If the exception type is 10
+ *  	        result *= 5;                                    //     (EXC_CRASH), then an error
+ *  	    }                                                   //     KERN_FAILURE is returned.
+ *  	    return result;                                      //     MIG will deallocate the
+ *  	}                                                       //     ports again.
+ *
+ *
+ *  This double-deallocate of the port names is problematic because a process can set any ports it
+ *  wants as the task and thread ports in the exception message. Launchd performs no checks that
+ *  the received send rights actually correspond to a thread and a task; the ports could, for
+ *  example, be send rights to ports already in launchd's IPC space. Then the double-deallocate
+ *  would actually cause launchd to drop a user reference on one of its own ports.
+ *
+ *  This bug can be exploited to free launchd's send right to any Mach port to which the attacking
+ *  process also has a send right. In particular, if the attacking process can look up a system
+ *  service using launchd, then it can free launchd's send right to that service and then
+ *  impersonate the service to the rest of the system. After that there are many different routes
+ *  to gain system privileges.
  *
  */
 
@@ -397,6 +470,9 @@ launchd_replace_service_port(const char *service_name,
 			DEBUG_TRACE(1, "%s: Got something unexpected! %x", __func__, new_service);
 		}
 #endif
+		// Deallocate the new service port. If it's the replacement port we already have a
+		// ref on it, and if it's something else then we're not going to use it.
+		mach_port_deallocate(mach_task_self(), new_service);
 		// Increment our try count if everything before succeeded.
 		if (ok) {
 			try++;
