@@ -1,4 +1,5 @@
-# launchd-portrep
+launchd-portrep
+===================================================================================================
 
 <!-- Brandon Azad -->
 
@@ -9,7 +10,8 @@ the attacker also has a send right. This allows the attacker to impersonate any 
 can look up to the rest of the system.
 
 
-## The vulnerability
+The vulnerability
+---------------------------------------------------------------------------------------------------
 
 Launchd multiplexes multiple different Mach message handlers over its main port, including a MIG
 handler for exception messages. If a process sends a `mach_exception_raise` or
@@ -104,7 +106,8 @@ service to the rest of the system. After that there are many different routes to
 privileges.
 
 
-## Exploit strategy
+Exploit strategy to get host-priv
+---------------------------------------------------------------------------------------------------
 
 This bug is a less general version of [CVE-2016-7637], a Mach port user reference handling issue in
 XNU discovered by Ian Beer that allowed processes to free Mach ports in other processes. Ian Beer
@@ -145,23 +148,46 @@ restarting coreservicesd using launchctl seems to fix it:
 	$ sudo launchctl kickstart -k -p system/com.apple.coreservicesd
 
 
-## Usage
+Once we have host-priv
+---------------------------------------------------------------------------------------------------
 
-To build, run `make`. See the top of the Makefile for various build options.
+Once we have the host-priv port, we can control any task on the system. Once again I use the same
+strategy as Ian Beer's original exploit: hijack a root process and make it execute our exploit
+payload. This exploit targets the ReportCrash process running as root. Using the task port, we can
+allocate memory in the task's address space, copy in an exploit payload, and then create a new
+thread in ReportCrash to run the payload.
 
-Run the exploit by specifying the target leak size on the command line:
+The easiest payload to run is to force the hijacked process to exec `/bin/bash` to run a command
+string. The command string is arbitrary: it is supplied on the command line. For example, the
+accompanying `launchd-portrep-rootsh.sh` script creates a setuid root shell launcher under `/var`.
 
-	$ ./launchd-portrep
-	[+] Got task port 1df73 for process 1266
-	[+] Got host priv port 17537!
-	[+] launchd task: 1e2ef
-	[+] Fixed up launchd
+
+Usage
+---------------------------------------------------------------------------------------------------
+
+To build the standalone exploit `launchd-portrep`, run `make`. See the top of the Makefile for
+various build options.
+
+Run the exploit by specifying the command to run as if it were being given to `bash -c`.
+
+	$ ./launchd-portrep '/usr/bin/touch /tmp/exploit-success'
+	[+] Replaced com.apple.CoreServices.coreservicesd with replacer port 1e8ef (index 33) after 59 tries
+	[+] Got task port bb7b for process 3174
+	[+] Got host priv port ba3b!
 	[+] We did it :) Yay!
+	[+] Hijacking process 3176
+	$ ls -la /tmp/exploit-success
+	-rw-r--r--  1 root  wheel  0 Jan 28 12:39 /tmp/exploit-success
+
+There is also an example script `launchd-portrep-rootsh.sh` that will use launchd-portrep to
+install a setuid-root shell launcher under `/var/suid-sh`. Any user that runs this binary will be
+presented with a root shell. You should probably ensure this file is removed when done. :)
 
 launchd-portrep has been tested on macOS 10.13.4 Beta 17E139j.
 
 
-## License
+License
+---------------------------------------------------------------------------------------------------
 
 The launchd-portrep code is released under the MIT license.
 

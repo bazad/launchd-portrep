@@ -22,9 +22,11 @@ endif
 FRAMEWORKS =
 
 SOURCES = launchd-portrep.c \
+	  launchd-portrep-hostpriv.c \
 	  main.c
 
-HEADERS = launchd-portrep.h
+HEADERS = launchd-portrep.h \
+	  launchd-portrep-hostpriv.h
 
 all: $(TARGET)
 

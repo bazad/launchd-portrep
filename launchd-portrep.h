@@ -64,8 +64,16 @@ bool launchd_replace_service_port(const char *service_name,
  * 	- W: Warning:   Used to indicate that an unusual but recoverable condition was encountered.
  * 	- E: Error:     Used to indicate that an unrecoverable error was encountered.
  * 	                launchd-portrep might continue running after an error was encountered, but
- * 	                it almost certainly will not succeed.
+ * 	                it probably will not succeed.
  */
 extern void (*launchd_portrep_log)(char type, const char *format, va_list ap);
+
+/*
+ * launchd_portrep_log_stderr
+ *
+ * Description:
+ * 	The default log implementation, which logs all messages to stderr.
+ */
+void launchd_portrep_log_stderr(char type, const char *format, va_list ap);
 
 #endif

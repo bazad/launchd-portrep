@@ -147,8 +147,8 @@ log_internal(char type, const char *format, ...) {
 }
 
 // The default logging implementation simply prints to stderr.
-static void
-log_to_stderr(char type, const char *format, va_list ap) {
+void
+launchd_portrep_log_stderr(char type, const char *format, va_list ap) {
 	char *message = NULL;
 	vasprintf(&message, format, ap);
 	assert(message != NULL);
@@ -165,7 +165,7 @@ log_to_stderr(char type, const char *format, va_list ap) {
 	free(message);
 }
 
-void (*launchd_portrep_log)(char type, const char *format, va_list ap) = log_to_stderr;
+void (*launchd_portrep_log)(char type, const char *format, va_list ap) = launchd_portrep_log_stderr;
 
 // ---- Freeing a Mach send right in launchd ------------------------------------------------------
 
@@ -455,8 +455,8 @@ launchd_replace_service_port(const char *service_name,
 		for (size_t i = 0; i < PORT_COUNT; i++) {
 			if (new_service == ports[i]) {
 				assert(replacement_port == MACH_PORT_NULL);
-				DEBUG_TRACE(1, "Replaced %s with replacer port %zu after %zu %s",
-						service_name, i, try,
+				INFO("Replaced %s with replacer port %x (index %zu) after %zu %s",
+						service_name, ports[i], i, try,
 						(try == 1 ? "try" : "tries"));
 				replacement_port = ports[i];
 			} else {
