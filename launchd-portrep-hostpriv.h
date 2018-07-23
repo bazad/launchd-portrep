@@ -45,31 +45,4 @@ mach_port_t host_priv_task_for_pid(mach_port_t host_priv, int pid);
  */
 bool launchd_start_service(const char *service_name, bool wait);
 
-/*
- * launchd_portrep_hostpriv_log
- *
- * Description:
- * 	This is the log handler that will be executed when launchd-portrep-hostpriv wants to log a
- * 	message. The default implementation logs the message to stderr. Setting this value to NULL
- * 	will disable all logging. Specify a custom log handler to process log messages in another
- * 	way.
- *
- * Parameters:
- * 	type				A character representing the type of message that is being
- * 					logged.
- * 	format				A printf-style format string describing the error message.
- * 	ap				The variadic argument list for the format string.
- *
- * Log Type:
- * 	The type parameters is one of:
- * 	- D: Debug:     Used for debugging messages. Set the DEBUG build variable to control debug
- * 	                verbosity.
- * 	- I: Info:      Used to convey general information about the exploit or its progress.
- * 	- W: Warning:   Used to indicate that an unusual but recoverable condition was encountered.
- * 	- E: Error:     Used to indicate that an unrecoverable error was encountered.
- * 	                launchd-portrep-hostpriv  might continue running after an error was
- * 	                encountered, but it probably will not succeed.
- */
-extern void (*launchd_portrep_hostpriv_log)(char type, const char *format, va_list ap);
-
 #endif

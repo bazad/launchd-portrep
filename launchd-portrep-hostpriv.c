@@ -52,6 +52,7 @@
 #include "launchd-portrep-hostpriv.h"
 
 #include "launchd-portrep.h"
+#include "log.h"
 
 #include <assert.h>
 #include <bootstrap.h>
@@ -60,37 +61,6 @@
 #include <mach/mach_vm.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-// ---- Logging -----------------------------------------------------------------------------------
-
-#define DEBUG_LEVEL(level)	(DEBUG && level <= DEBUG)
-
-#if DEBUG
-#define DEBUG_TRACE(level, fmt, ...)						\
-	do {									\
-		if (DEBUG_LEVEL(level)) {					\
-			log_internal('D', fmt, ##__VA_ARGS__);			\
-		}								\
-	} while (0)
-#else
-#define DEBUG_TRACE(level, fmt, ...)	do {} while (0)
-#endif
-#define INFO(fmt, ...)			log_internal('I', fmt, ##__VA_ARGS__)
-#define WARNING(fmt, ...)		log_internal('W', fmt, ##__VA_ARGS__)
-#define ERROR(fmt, ...)			log_internal('E', fmt, ##__VA_ARGS__)
-
-// A function to call the logging implementation.
-static void
-log_internal(char type, const char *format, ...) {
-	if (launchd_portrep_hostpriv_log != NULL) {
-		va_list ap;
-		va_start(ap, format);
-		launchd_portrep_hostpriv_log(type, format, ap);
-		va_end(ap);
-	}
-}
-
-void (*launchd_portrep_hostpriv_log)(char type, const char *format, va_list ap) = launchd_portrep_log_stderr;
 
 // ---- Convenience functions ---------------------------------------------------------------------
 

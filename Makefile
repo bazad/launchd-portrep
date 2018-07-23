@@ -23,10 +23,12 @@ FRAMEWORKS =
 
 SOURCES = launchd-portrep.c \
 	  launchd-portrep-hostpriv.c \
+	  log.c \
 	  main.c
 
 HEADERS = launchd-portrep.h \
-	  launchd-portrep-hostpriv.h
+	  launchd-portrep-hostpriv.h \
+	  log.h
 
 all: $(TARGET)
 

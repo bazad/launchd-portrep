@@ -38,6 +38,7 @@
 
 #include "launchd-portrep.h"
 #include "launchd-portrep-hostpriv.h"
+#include "log.h"
 
 #include <assert.h>
 #include <libproc.h>
@@ -48,9 +49,6 @@
 #include <unistd.h>
 
 // ---- Logging -----------------------------------------------------------------------------------
-
-#define TRACE(fmt, ...)		log_internal('I', fmt, ##__VA_ARGS__)
-#define ERROR(fmt, ...)		log_internal('E', fmt, ##__VA_ARGS__)
 
 // A log function to print the message to stdout in classic hacker style.
 static void
@@ -64,15 +62,6 @@ log(char type, const char *format, va_list ap) {
 	vasprintf(&msg, format, ap);
 	printf("[%c] %s\n", type, msg);
 	free(msg);
-}
-
-// A helper function to call log in this file.
-static void
-log_internal(char type, const char *format, ...) {
-	va_list ap;
-	va_start(ap, format);
-	log(type, format, ap);
-	va_end(ap);
 }
 
 // ---- Process functions -------------------------------------------------------------------------
@@ -170,7 +159,7 @@ get_target_task(mach_port_t host_priv) {
 		return MACH_PORT_NULL;
 	}
 	// Get the task port.
-	TRACE("Hijacking process %d", pid);
+	INFO("Hijacking process %d", pid);
 	mach_port_t task = host_priv_task_for_pid(host_priv, pid);
 	if (task == MACH_PORT_NULL) {
 		ERROR("Could not get task for PID %d process %s", pid, path);
@@ -269,8 +258,7 @@ main(int argc, const char *argv[]) {
 		       argv[0]);
 		return 1;
 	}
-	launchd_portrep_log = log;
-	launchd_portrep_hostpriv_log = log;
+	log_implementation = log;
 	// Run the exploit to get the host-priv port.
 	mach_port_t host_priv = launchd_portrep_host_priv();
 	if (host_priv == MACH_PORT_NULL) {
