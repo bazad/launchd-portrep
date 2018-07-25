@@ -106,13 +106,13 @@ service to the rest of the system. After that there are many different routes to
 privileges.
 
 
-Exploit strategy to get host-priv
----------------------------------------------------------------------------------------------------
+Exploit strategy to get task_for_pid-allow
+------------------------------------------------------------------------------------------------
 
 This bug is a less general version of [CVE-2016-7637], a Mach port user reference handling issue in
 XNU discovered by Ian Beer that allowed processes to free Mach ports in other processes. Ian Beer
 exploited that vulnerability on macOS by replacing launchd's send right to the
-`com.apple.CoreServices.coreservicesd` endpoint and impersonating coreservicesd to the rest of the
+com.apple.CoreServices.coreservicesd endpoint and impersonating coreservicesd to the rest of the
 system. Coreservicesd is an attractive target because it is one of a few services to which clients
 will send their task port in a Mach message. By replacing launchd's send right to coreservicesd
 with his own port and then triggering privileged clients to look up and communicate with
@@ -124,18 +124,19 @@ within that process.
 Since the behavior on macOS hasn't changed, I basically copied Ian Beer's exploit strategy for this
 vulnerability. We send exception messages to launchd containing coreservicesd's service port until
 we free launchd's send right to that port. We can detect when we've freed the right by calling
-`bootstrap_look_up` again on the service: if launchd returns an invalid port name, then we've
+bootstrap_look_up() again on the service: if launchd returns an invalid port name, then we've
 successfully freed launchd's send right to the port. Then, we repeatedly register and unregister a
 large number of services with launchd until one of the services we register is assigned the same
 Mach port name in launchd's IPC space as the original coreservicesd port. At this point, any
-process that looks up `com.apple.CoreServices.coreservicesd` in launchd will receive a send right
-to our fake service rather than the real coreservicesd. We then run a MITM server on the fake
-service port, inspecting all Mach ports in the messages received from clients before sending them
-along to the real coreservicesd. Eventually a privileged client will connect and send us its task
-port, allowing us to extract the host-priv port. Once we have the host-priv port, we can get the
-task port for any task on the system.
+process that looks up com.apple.CoreServices.coreservicesd in launchd will receive a send right to
+our fake service rather than the real coreservicesd. We then run a MITM server on the fake service
+port, inspecting all Mach ports in the messages received from clients before sending them along to
+the real coreservicesd. At this point we send a message to sysdiagnose causing it to run a
+tailspin, which causes sysdiagnose to connect to our fake coreservicesd port and send us its task
+port. Since sysdiagnose has the `task_for_pid-allow` entitlement, we can now get the task port for
+any process.
 
-In order to (mostly) restore proper functioning of the system, we use the host-priv port to obtain
+In order to (mostly) restore proper functioning of the system, we use sysdiagnose to obtain
 launchd's task port, and then use launchd's task port to replace launchd's send right to our fake
 service port back with a send right to the real coreservicesd. That way future clients can actually
 reach coreservicesd.
@@ -148,42 +149,62 @@ restarting coreservicesd using launchctl seems to fix it:
 	$ sudo launchctl kickstart -k -p system/com.apple.coreservicesd
 
 
-Once we have host-priv
----------------------------------------------------------------------------------------------------
+Once we have task_for_pid-allow
+------------------------------------------------------------------------------------------------
 
-Once we have the host-priv port, we can control any task on the system. Once again I use the same
-strategy as Ian Beer's original exploit: hijack a root process and make it execute our exploit
-payload. This exploit targets the ReportCrash process running as root. Using the task port, we can
-allocate memory in the task's address space, copy in an exploit payload, and then create a new
-thread in ReportCrash to run the payload.
+Once we have code execution inside a `task_for_pid-allow` process, we can control any task on the
+system. This is great because not only can we perform the standard elevation of privileges, but we
+can also bypass SIP by injecting code into SIP-entitled processes.
 
-The easiest payload to run is to force the hijacked process to exec `/bin/bash` to run a command
-string. The command string is arbitrary: it is supplied on the command line. For example, the
-accompanying `launchd-portrep-rootsh.sh` script creates a setuid root shell launcher under `/var`.
+This exploit demonstrates two potential uses: system command execution as root and dylib injection.
+To execute a system command, we simply invoke the standard `system()` function from within
+sysdiagnose, passing it the command string supplied by the user. To inject a dylib into a process,
+we call `task_for_pid()` from within sysdiagnose to get the task port of the target, then use the
+task port to call `dlopen()` on the supplied library.
 
 
 Usage
 ---------------------------------------------------------------------------------------------------
 
 To build the standalone exploit `launchd-portrep`, run `make`. See the top of the Makefile for
-various build options.
+various build options. You will need to download and build the [threadexec] injection library
+first.
 
-Run the exploit by specifying the command to run as if it were being given to `bash -c`.
+[threadexec]: https://github.com/bazad/threadexec
 
-	$ ./launchd-portrep '/usr/bin/touch /tmp/exploit-success'
-	[+] Replaced com.apple.CoreServices.coreservicesd with replacer port 1e8ef (index 33) after 59 tries
-	[+] Got task port bb7b for process 3174
-	[+] Got host priv port ba3b!
-	[+] We did it :) Yay!
-	[+] Hijacking process 3176
+	$ git clone https://github.com/bazad/launchd-portrep
+	$ cd launchd-portrep
+	$ git clone https://github.com/bazad/threadexec
+	$ cd threadexec
+	$ make ARCH=x86_64 SDK=macosx
+	$ cd ..
+	$ make
+
+Note that the exploit as written will fail if the sysdiagnose process is already running. Thus, for
+the purposes of this proof of concept, be sure to kill sysdiagnose before running the exploit.
+
+Run the exploit by specifying the command to run as if it were being given to the `system()`
+function:
+
+	$ ./launchd-portrep 'touch /tmp/exploit-success'
+	[+] Freed launchd service port for com.apple.CoreServices.coreservicesd
+	[+] Replaced com.apple.CoreServices.coreservicesd with replacer port 0xd77 (index 196) after 28 tries
+	[+] Sysdiagnose has PID 499
+	[+] Found sysdiagnose task port 0x1767b
+	[+] Command exited with status: 0
 	$ ls -la /tmp/exploit-success
-	-rw-r--r--  1 root  wheel  0 Jan 28 12:39 /tmp/exploit-success
+	-rw-r--r--  1 root  wheel  0 Jul 24 23:50 /tmp/exploit-success
 
 There is also an example script `launchd-portrep-rootsh.sh` that will use launchd-portrep to
 install a setuid-root shell launcher under `/var/suid-sh`. Any user that runs this binary will be
 presented with a root shell. You should probably ensure this file is removed when done. :)
 
-launchd-portrep has been tested on macOS 10.13.4 Beta 17E139j.
+Alternatively, specify the PID of the process you want to inject into and the path to the dylib to
+inject:
+
+	$ ./launchd-portrep 450 $PWD/inject.dylib
+
+launchd-portrep has been tested on macOS 10.13.5 17F77.
 
 
 License
@@ -193,5 +214,4 @@ The launchd-portrep code is released under the MIT license.
 
 
 ---------------------------------------------------------------------------------------------------
-
-By Brandon Azad
+Brandon Azad

